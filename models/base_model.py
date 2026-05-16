@@ -1,6 +1,9 @@
 """Abstract base class for all March Madness prediction models."""
 
 from abc import ABC, abstractmethod
+import hashlib
+import hmac
+import os
 import pickle
 from pathlib import Path
 
@@ -14,6 +17,13 @@ from sklearn.metrics import (
 )
 
 from config import RANDOM_SEED, CV_FOLDS
+
+# pickle.load is unsafe on untrusted input. We append an HMAC-SHA256 of the
+# pickle payload to every saved file and verify it on load. The key is read
+# from MARCH_MADNESS_MODEL_KEY (defaults to a constant for local dev — set a
+# real per-user secret in your environment for any shared model store).
+_HMAC_KEY = os.environ.get("MARCH_MADNESS_MODEL_KEY", "march-madness-local-dev").encode()
+_HMAC_SIZE = 32  # SHA-256 digest length
 
 
 class BaseMarchMadnessModel(ABC):
@@ -87,18 +97,35 @@ class BaseMarchMadnessModel(ABC):
     # Persistence
     # ------------------------------------------------------------------
     def save(self, path: str | Path) -> None:
-        """Serialize the entire model wrapper to *path* using pickle."""
+        """Serialize the entire model wrapper to *path* with an HMAC tag."""
         self._check_fitted()
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
+        payload = pickle.dumps(self)
+        tag = hmac.new(_HMAC_KEY, payload, hashlib.sha256).digest()
         with open(path, "wb") as f:
-            pickle.dump(self, f)
+            f.write(tag)
+            f.write(payload)
 
     @classmethod
     def load(cls, path: str | Path) -> "BaseMarchMadnessModel":
-        """Deserialize a model wrapper previously saved with :meth:`save`."""
+        """Deserialize a model wrapper previously saved with :meth:`save`.
+
+        Verifies an HMAC tag before unpickling, so an attacker cannot trigger
+        arbitrary code execution by swapping in a crafted file.
+        """
         with open(path, "rb") as f:
-            model = pickle.load(f)
+            blob = f.read()
+        if len(blob) < _HMAC_SIZE:
+            raise ValueError(f"Model file {path} is too small to contain HMAC tag")
+        tag, payload = blob[:_HMAC_SIZE], blob[_HMAC_SIZE:]
+        expected = hmac.new(_HMAC_KEY, payload, hashlib.sha256).digest()
+        if not hmac.compare_digest(tag, expected):
+            raise ValueError(
+                f"HMAC verification failed for {path}. Refusing to unpickle "
+                "potentially untrusted model file."
+            )
+        model = pickle.loads(payload)
         if not isinstance(model, BaseMarchMadnessModel):
             raise TypeError(
                 f"Loaded object is {type(model).__name__}, "
